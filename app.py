@@ -24,6 +24,7 @@ MODELO = os.environ.get("WHISPER_MODEL", "medium")
 TOKEN = os.environ.get("TRANSCRITOR_TOKEN", "")
 THREADS = int(os.environ.get("WHISPER_THREADS", "0"))  # 0 = automatico
 IDIOMA = os.environ.get("WHISPER_LANG", "pt")
+BLOCO_S = int(os.environ.get("WHISPER_BLOCO_S", "600"))  # transcreve em blocos de N s: memoria constante mesmo em reuniao longa
 
 app = FastAPI(title="AIVEXOR Transcritor")
 model = WhisperModel(MODELO, device="cpu", compute_type="int8", cpu_threads=THREADS)
@@ -70,6 +71,63 @@ def _fontes(path: str):
     return fontes
 
 
+def _duracao_s(path: str) -> float:
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def _corta_bloco(wav: str, inicio: float, dur: float, saida: str):
+    """Recorta [inicio, inicio+dur) do wav pra um novo wav 16kHz mono."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", str(inicio), "-t", str(dur), "-i", wav,
+         "-ar", "16000", "-ac", "1", saida],
+        capture_output=True,
+    )
+
+
+def _transcrever_fonte(rotulo: str, wav: str):
+    """Transcreve um canal em blocos de BLOCO_S, um por vez, pra nao carregar a
+    reuniao inteira na memoria de uma vez. Devolve (idioma, [segmentos]) com os
+    tempos ja deslocados pro tempo real do audio."""
+    dur_total = _duracao_s(wav)
+    offset = 0.0
+    idioma = None
+    segs_out = []
+    # audio curto (<= 1 bloco) cai no while uma vez so: mesmo comportamento de antes
+    while offset < dur_total or (dur_total == 0.0 and offset == 0.0):
+        bloco_dur = min(BLOCO_S, dur_total - offset) if dur_total else BLOCO_S
+        bloco = f"{wav}.b{int(offset)}.wav"
+        _corta_bloco(wav, offset, bloco_dur, bloco)
+        try:
+            segs, info = model.transcribe(bloco, language=IDIOMA, vad_filter=True)
+            idioma = info.language
+            for s in segs:
+                txt = s.text.strip()
+                if txt:
+                    segs_out.append({
+                        "inicio": round(s.start + offset, 2),
+                        "fim": round(s.end + offset, 2),
+                        "falante": rotulo,
+                        "texto": txt,
+                    })
+        finally:
+            try:
+                os.remove(bloco)
+            except OSError:
+                pass
+        if not dur_total:
+            break
+        offset += bloco_dur
+    return idioma, segs_out
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "modelo": MODELO, "idioma": IDIOMA}
@@ -89,17 +147,10 @@ async def transcrever(arquivo: UploadFile = File(...), x_token: str = Header(def
     idioma_detectado = None
     try:
         for rotulo, wav in _fontes(src):
-            segs, info = model.transcribe(wav, language=IDIOMA, vad_filter=True)
-            idioma_detectado = info.language
-            for s in segs:
-                txt = s.text.strip()
-                if txt:
-                    segmentos.append({
-                        "inicio": round(s.start, 2),
-                        "fim": round(s.end, 2),
-                        "falante": rotulo,
-                        "texto": txt,
-                    })
+            idioma, segs = _transcrever_fonte(rotulo, wav)
+            if idioma:
+                idioma_detectado = idioma
+            segmentos.extend(segs)
             try:
                 os.remove(wav)
             except OSError:
