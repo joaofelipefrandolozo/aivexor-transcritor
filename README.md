@@ -6,9 +6,25 @@ Roda na VPS (KVM4), chamado pelo n8n. Whisper local, sem custo por minuto.
 
 ## Endpoints
 
-- `GET /health` → `{ ok, modelo, idioma }`
+- `GET /health` → `{ ok, modelo, idioma, ocupado }`
 - `POST /transcrever` → multipart com campo `arquivo`; header `X-Token` se protegido.
   Resposta: `{ idioma, duracao_s, n_segmentos, texto, segmentos[] }`
+
+## Robustez (aprendida nos incidentes de 2026-07-13 e 2026-07-16)
+
+- **`/health` responde sempre**, inclusive durante uma transcrição (endpoints
+  síncronos rodam no threadpool; antes, um request travado matava o serviço
+  inteiro e o health junto).
+- **Todo ffmpeg/ffprobe tem timeout**: subprocess pendurado vira erro HTTP
+  limpo, não serviço morto.
+- **1 transcrição por vez**: um segundo POST recebe `503 ocupado` na hora
+  (protege a memória da VPS). Quem chama deve tentar de novo depois.
+- **Transcrição em blocos** (`WHISPER_BLOCO_S`, default 600s): memória
+  constante em qualquer duração de reunião.
+- **HEALTHCHECK no Dockerfile**: o Docker/EasyPanel marca o container
+  unhealthy quando o HTTP para de responder (visível no painel).
+- Um watchdog no n8n ("AIVEXOR Watchdog Transcritor") vigia o `/health` a
+  cada 15 min e avisa no WhatsApp quando cai e quando volta.
 
 ## Deploy no EasyPanel
 

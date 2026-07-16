@@ -9,13 +9,23 @@ usando a convencao de 2 canais do gravador:
 Se o audio for mono (ex.: gravado no celular), transcreve corrido, sem rotulo.
 Usa VAD pra pular silencios (cada canal so processa quando ha voz).
 
+Robustez (aprendida nos incidentes de 2026-07-13 e 2026-07-16):
+  - endpoints sincronos (def): o FastAPI roda cada request numa thread do pool,
+    entao o /health SEMPRE responde, mesmo com uma transcricao em andamento
+    (antes, um request travado matava o servico inteiro pra sempre);
+  - todo ffmpeg/ffprobe tem timeout: subprocess pendurado nao segura o request;
+  - so 1 transcricao por vez (lock): um segundo request recebe 503 na hora em
+    vez de disputar CPU/memoria e derrubar o container.
+
 Endpoints:
-  GET  /health       -> status + modelo carregado
+  GET  /health       -> status + modelo carregado + se esta ocupado
   POST /transcrever  -> multipart 'arquivo'; header 'X-Token' se TRANSCRITOR_TOKEN setado
 """
 import os
+import shutil
 import subprocess
 import tempfile
+import threading
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from faster_whisper import WhisperModel
@@ -28,14 +38,24 @@ BLOCO_S = int(os.environ.get("WHISPER_BLOCO_S", "600"))  # transcreve em blocos 
 
 app = FastAPI(title="AIVEXOR Transcritor")
 model = WhisperModel(MODELO, device="cpu", compute_type="int8", cpu_threads=THREADS)
+_ocupado = threading.Lock()  # 1 transcricao por vez: protege memoria/CPU da VPS
+
+
+def _run(cmd, timeout_s):
+    """subprocess com timeout: ffmpeg travado vira erro limpo, nao servico morto."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500,
+                            detail=f"{os.path.basename(cmd[0])} excedeu {timeout_s}s")
 
 
 def _num_canais(path: str) -> int:
-    r = subprocess.run(
+    r = _run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
          "-show_entries", "stream=channels", "-of",
          "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True,
+        timeout_s=60,
     )
     try:
         return int(r.stdout.strip())
@@ -49,10 +69,13 @@ def _extrair(path: str, canal_idx, saida: str):
         filtro = ["-ac", "1"]
     else:
         filtro = ["-filter_complex", f"pan=mono|c0=c{canal_idx}"]
-    subprocess.run(
+    r = _run(
         ["ffmpeg", "-y", "-i", path, *filtro, "-ar", "16000", saida],
-        capture_output=True,
+        timeout_s=900,
     )
+    if r.returncode != 0 or not os.path.exists(saida):
+        raise HTTPException(status_code=422,
+                            detail="audio invalido: ffmpeg nao conseguiu extrair o canal")
 
 
 def _fontes(path: str):
@@ -72,10 +95,10 @@ def _fontes(path: str):
 
 
 def _duracao_s(path: str) -> float:
-    r = subprocess.run(
+    r = _run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True,
+        timeout_s=60,
     )
     try:
         return float(r.stdout.strip())
@@ -85,10 +108,10 @@ def _duracao_s(path: str) -> float:
 
 def _corta_bloco(wav: str, inicio: float, dur: float, saida: str):
     """Recorta [inicio, inicio+dur) do wav pra um novo wav 16kHz mono."""
-    subprocess.run(
+    _run(
         ["ffmpeg", "-y", "-ss", str(inicio), "-t", str(dur), "-i", wav,
          "-ar", "16000", "-ac", "1", saida],
-        capture_output=True,
+        timeout_s=300,
     )
 
 
@@ -130,43 +153,49 @@ def _transcrever_fonte(rotulo: str, wav: str):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "modelo": MODELO, "idioma": IDIOMA}
+    # def sincrono: roda no threadpool, responde mesmo durante uma transcricao
+    return {"ok": True, "modelo": MODELO, "idioma": IDIOMA, "ocupado": _ocupado.locked()}
 
 
 @app.post("/transcrever")
-async def transcrever(arquivo: UploadFile = File(...), x_token: str = Header(default="")):
+def transcrever(arquivo: UploadFile = File(...), x_token: str = Header(default="")):
     if TOKEN and x_token != TOKEN:
         raise HTTPException(status_code=401, detail="token invalido")
-
-    suffix = os.path.splitext(arquivo.filename or "audio")[1] or ".bin"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await arquivo.read())
-        src = tmp.name
-
-    segmentos = []
-    idioma_detectado = None
+    if not _ocupado.acquire(blocking=False):
+        raise HTTPException(status_code=503,
+                            detail="transcritor ocupado com outro audio; tente de novo em alguns minutos")
     try:
-        for rotulo, wav in _fontes(src):
-            idioma, segs = _transcrever_fonte(rotulo, wav)
-            if idioma:
-                idioma_detectado = idioma
-            segmentos.extend(segs)
+        suffix = os.path.splitext(arquivo.filename or "audio")[1] or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(arquivo.file, tmp)
+            src = tmp.name
+
+        segmentos = []
+        idioma_detectado = None
+        try:
+            for rotulo, wav in _fontes(src):
+                idioma, segs = _transcrever_fonte(rotulo, wav)
+                if idioma:
+                    idioma_detectado = idioma
+                segmentos.extend(segs)
+                try:
+                    os.remove(wav)
+                except OSError:
+                    pass
+        finally:
             try:
-                os.remove(wav)
+                os.remove(src)
             except OSError:
                 pass
-    finally:
-        try:
-            os.remove(src)
-        except OSError:
-            pass
 
-    segmentos.sort(key=lambda x: x["inicio"])
-    texto = "\n".join(f"{s['falante']}: {s['texto']}" for s in segmentos)
-    return {
-        "idioma": idioma_detectado,
-        "duracao_s": round(segmentos[-1]["fim"], 1) if segmentos else 0,
-        "n_segmentos": len(segmentos),
-        "texto": texto,
-        "segmentos": segmentos,
-    }
+        segmentos.sort(key=lambda x: x["inicio"])
+        texto = "\n".join(f"{s['falante']}: {s['texto']}" for s in segmentos)
+        return {
+            "idioma": idioma_detectado,
+            "duracao_s": round(segmentos[-1]["fim"], 1) if segmentos else 0,
+            "n_segmentos": len(segmentos),
+            "texto": texto,
+            "segmentos": segmentos,
+        }
+    finally:
+        _ocupado.release()
