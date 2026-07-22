@@ -9,13 +9,19 @@ usando a convencao de 2 canais do gravador:
 Se o audio for mono (ex.: gravado no celular), transcreve corrido, sem rotulo.
 Usa VAD pra pular silencios (cada canal so processa quando ha voz).
 
-Robustez (aprendida nos incidentes de 2026-07-13 e 2026-07-16):
+Robustez (aprendida nos incidentes de 2026-07-13, 2026-07-16 e 2026-07-21):
   - endpoints sincronos (def): o FastAPI roda cada request numa thread do pool,
     entao o /health SEMPRE responde, mesmo com uma transcricao em andamento
     (antes, um request travado matava o servico inteiro pra sempre);
   - todo ffmpeg/ffprobe tem timeout: subprocess pendurado nao segura o request;
   - so 1 transcricao por vez (lock): um segundo request recebe 503 na hora em
-    vez de disputar CPU/memoria e derrubar o container.
+    vez de disputar CPU/memoria e derrubar o container;
+  - watchdog de tempo ocupado: o Whisper nao tem timeout interno, entao um bloco
+    travado prenderia o lock pra sempre e o /health seguiria dizendo 200 (servico
+    "zumbi", vivo por fora e travado por dentro, sem alerta: incidente 2026-07-21,
+    7h30 preso). Se uma transcricao passa de OCUPADO_TETO_S, o processo se derruba
+    pra o container reiniciar limpo; o /health expoe ocupado_s pra o watchdog do
+    n8n ver o tempo, nao so se responde.
 
 Endpoints:
   GET  /health       -> status + modelo carregado + se esta ocupado
@@ -26,6 +32,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from faster_whisper import WhisperModel
@@ -35,10 +42,34 @@ TOKEN = os.environ.get("TRANSCRITOR_TOKEN", "")
 THREADS = int(os.environ.get("WHISPER_THREADS", "0"))  # 0 = automatico
 IDIOMA = os.environ.get("WHISPER_LANG", "pt")
 BLOCO_S = int(os.environ.get("WHISPER_BLOCO_S", "600"))  # transcreve em blocos de N s: memoria constante mesmo em reuniao longa
+# teto de tempo pra UMA transcricao. No fluxo correto (pedacos de 12 min) um
+# request leva ~15 min, entao 40 min (2400s) so estoura em travamento real.
+OCUPADO_TETO_S = int(os.environ.get("OCUPADO_TETO_S", "2400"))
 
 app = FastAPI(title="AIVEXOR Transcritor")
 model = WhisperModel(MODELO, device="cpu", compute_type="int8", cpu_threads=THREADS)
 _ocupado = threading.Lock()  # 1 transcricao por vez: protege memoria/CPU da VPS
+_ocupado_desde = None  # time.monotonic() de quando o lock foi pego; None = livre
+
+
+def _watchdog_ocupado():
+    """Rede de seguranca contra transcricao presa. O Whisper nao tem timeout
+    interno: se model.transcribe pendura num bloco, o lock nunca liberaria e o
+    /health seguiria 200 (servico zumbi, sem alerta). Aqui, passado o teto, o
+    processo se derruba: o container reinicia limpo (restart policy/HEALTHCHECK),
+    o lock some e o watchdog do n8n ve a transicao caiu/voltou. Um restart de
+    ~1 min e sempre melhor que um zumbi de horas."""
+    while True:
+        time.sleep(30)
+        inicio = _ocupado_desde
+        if inicio is not None and (time.monotonic() - inicio) > OCUPADO_TETO_S:
+            preso = int(time.monotonic() - inicio)
+            print(f"[watchdog] transcricao presa ha {preso}s (teto {OCUPADO_TETO_S}s); "
+                  f"derrubando o processo pra reiniciar limpo e liberar o lock.", flush=True)
+            os._exit(1)
+
+
+threading.Thread(target=_watchdog_ocupado, daemon=True).start()
 
 
 def _run(cmd, timeout_s):
@@ -153,17 +184,24 @@ def _transcrever_fonte(rotulo: str, wav: str):
 
 @app.get("/health")
 def health():
-    # def sincrono: roda no threadpool, responde mesmo durante uma transcricao
-    return {"ok": True, "modelo": MODELO, "idioma": IDIOMA, "ocupado": _ocupado.locked()}
+    # def sincrono: roda no threadpool, responde mesmo durante uma transcricao.
+    # ocupado_s = ha quantos segundos esta preso numa transcricao (0 = livre);
+    # o watchdog do n8n olha esse numero, nao so se o /health responde.
+    inicio = _ocupado_desde
+    ocupado_s = round(time.monotonic() - inicio, 1) if inicio is not None else 0
+    return {"ok": True, "modelo": MODELO, "idioma": IDIOMA,
+            "ocupado": _ocupado.locked(), "ocupado_s": ocupado_s, "teto_s": OCUPADO_TETO_S}
 
 
 @app.post("/transcrever")
 def transcrever(arquivo: UploadFile = File(...), x_token: str = Header(default="")):
+    global _ocupado_desde
     if TOKEN and x_token != TOKEN:
         raise HTTPException(status_code=401, detail="token invalido")
     if not _ocupado.acquire(blocking=False):
         raise HTTPException(status_code=503,
                             detail="transcritor ocupado com outro audio; tente de novo em alguns minutos")
+    _ocupado_desde = time.monotonic()
     try:
         suffix = os.path.splitext(arquivo.filename or "audio")[1] or ".bin"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -198,4 +236,5 @@ def transcrever(arquivo: UploadFile = File(...), x_token: str = Header(default="
             "segmentos": segmentos,
         }
     finally:
+        _ocupado_desde = None
         _ocupado.release()
