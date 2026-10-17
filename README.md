@@ -55,6 +55,25 @@ falha duas vezes (`MAX_TENTATIVAS`) vira `error` em vez de virar loop de restart
 - Um watchdog no n8n ("AIVEXOR Watchdog Transcritor") vigia o `/health` a
   cada 15 min e avisa no WhatsApp quando cai e quando volta.
 
+## Peso na VPS (revisto em 2026-10-16)
+
+O serviço é usado poucas horas por mês, mas segurava o modelo carregado 24h por
+dia: 0,9 GB parado e 1,84 GB depois da primeira transcrição, sem devolver.
+Agora:
+
+- **Modelo sob demanda**: só carrega quando chega áudio (3 a 4 s lendo do
+  `/cache`; a primeira carga depois de horas parado chegou a 49 s) e descarrega
+  depois de `WHISPER_OCIOSO_S` sem uso (padrão 600). O `/health` mostra
+  `modelo_carregado`.
+- **Memória devolvida** ao fim de cada transcrição (`malloc_trim`) e
+  `MALLOC_ARENA_MAX=2` no Dockerfile.
+- **Prioridade baixa de CPU** (`TRANSCRITOR_NICE`, padrão 10): os apps de
+  cliente na mesma VPS passam na frente; a transcrição só fica mais lenta
+  quando a VPS está ocupada.
+
+Medido no mesmo áudio de 3 min: parado 51 MB (era 888 MB), pico 1,62 GB (era
+1,98 GB), logo depois 850 MB (era 1,84 GB) e 88 MB depois de descarregar.
+
 ## Deploy no EasyPanel
 
 1. **Novo serviço** `transcritor` no **mesmo projeto** do n8n (pra falarem pela rede interna).
@@ -75,6 +94,9 @@ falha duas vezes (`MAX_TENTATIVAS`) vira `error` em vez de virar loop de restart
    - `JOBS_DIR=/jobs` (opcional, mas recomendado com volume: a fila sobrevive a
      restart. Sem volume, cai no diretório temporário do container)
    - `OCUPADO_FATOR=4` (opcional: teto do watchdog = duração do áudio × fator)
+   - `WHISPER_OCIOSO_S=600` (opcional: descarrega o modelo depois de N s sem
+     uso; `0` mantém sempre carregado)
+   - `TRANSCRITOR_NICE=10` (opcional: prioridade de CPU, `0` = normal)
 5. **Recursos (importante)**: limite a **~2 vCPU** e **~4 GB RAM**. A transcrição é
    assíncrona; melhor lenta do que sufocar o WhatsApp.
 6. **Volume persistente**: monte um volume em `/cache` (`HF_HOME`) pra não
@@ -94,7 +116,7 @@ curl -F "arquivo=@reuniao.opus" -H "X-Token: <segredo>" http://transcritor:8000/
 
 | Modelo    | RAM    | Qualidade PT | Velocidade (1h de reunião, ~2 vCPU) |
 |-----------|--------|--------------|-------------------------------------|
-| medium    | ~2 GB  | muito boa    | ~10-20 min                          |
-| large-v3  | ~3-4 GB| excelente    | ~25-45 min                          |
+| medium    | ~2 GB  | muito boa    | ~45-50 min (medido: 3 min em 2min19s) |
+| large-v3  | ~3-4 GB| excelente    | ~1h30 (estimado, ~2x o medium)      |
 
 Com VAD, os silêncios são pulados, então o tempo real costuma ficar abaixo disso.

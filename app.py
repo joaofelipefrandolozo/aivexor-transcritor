@@ -23,6 +23,13 @@ Robustez (aprendida nos incidentes de 2026-07-13, 2026-07-16 e 2026-07-21):
     pra o container reiniciar limpo; o /health expoe ocupado_s pra o watchdog do
     n8n ver o tempo, nao so se responde.
 
+Peso na VPS (medido em 2026-10-16): o modelo carregado no boot segurava 0,9 GB
+parado e 1,84 GB depois da primeira transcricao, sem devolver, 24h por dia, num
+servico usado poucas horas por mes. Agora o modelo so carrega quando chega audio,
+descarrega depois de WHISPER_OCIOSO_S parado, a memoria volta pro sistema ao fim
+de cada transcricao (malloc_trim) e o processo roda com prioridade baixa de CPU
+(os apps de cliente na mesma VPS passam na frente).
+
 Endpoints:
   GET  /health           -> status + modelo carregado + se esta ocupado + fila
   POST /transcrever      -> multipart 'arquivo'; SINCRONO (gravador desktop).
@@ -37,6 +44,8 @@ por pedaco, o que funciona no app desktop mas nao no celular (tela bloqueia,
 rede troca, o request morre). No assincrono o telefone so faz o upload; a fila
 roda na VPS e o CRM recebe o texto quando ficar pronto.
 """
+import ctypes
+import gc
 import hashlib
 import hmac
 import json
@@ -59,6 +68,8 @@ TOKEN = os.environ.get("TRANSCRITOR_TOKEN", "")
 THREADS = int(os.environ.get("WHISPER_THREADS", "0"))  # 0 = automatico
 IDIOMA = os.environ.get("WHISPER_LANG", "pt")
 BLOCO_S = int(os.environ.get("WHISPER_BLOCO_S", "600"))  # transcreve em blocos de N s: memoria constante mesmo em reuniao longa
+OCIOSO_S = int(os.environ.get("WHISPER_OCIOSO_S", "600"))  # descarrega o modelo apos N s sem uso; 0 = sempre carregado
+NICE = int(os.environ.get("TRANSCRITOR_NICE", "10"))  # prioridade de CPU (0 = normal, 19 = a mais baixa)
 # teto de tempo pra UMA transcricao. No fluxo sincrono (pedacos de 12 min) um
 # request leva ~15 min, entao 40 min (2400s) so estoura em travamento real.
 # No assincrono chega a reuniao inteira, e ai o teto vira proporcional a
@@ -88,7 +99,19 @@ app.add_middleware(
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
-model = WhisperModel(MODELO, device="cpu", compute_type="int8", cpu_threads=THREADS)
+if NICE:
+    try:
+        os.nice(NICE)  # aumentar o nice nao exige privilegio; as threads herdam
+    except OSError:
+        pass
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:
+    _libc = None
+
+_modelo = None  # carregado sob demanda por _modelo_whisper()
+_modelo_lock = threading.Lock()
+_ultimo_uso = time.monotonic()
 _ocupado = threading.Lock()  # 1 transcricao por vez: protege memoria/CPU da VPS
 _ocupado_desde = None  # time.monotonic() de quando o lock foi pego; None = livre
 _teto_atual = OCUPADO_TETO_S  # teto do job em andamento (o async ajusta pela duracao)
@@ -114,6 +137,55 @@ def _watchdog_ocupado():
 
 
 threading.Thread(target=_watchdog_ocupado, daemon=True).start()
+
+
+def _devolver_memoria():
+    """O glibc guarda a memoria liberada pro proprio processo em vez de devolver
+    ao sistema: sem o malloc_trim o container seguia com ~2 GB depois de uma
+    transcricao, mesmo sem fazer nada."""
+    gc.collect()
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
+
+
+def _modelo_whisper():
+    """Carrega o modelo na primeira vez que precisa (do volume /cache, segundos).
+    Quem chama ja segura o _ocupado, entao nunca concorre com o descarregador."""
+    global _modelo
+    with _modelo_lock:
+        if _modelo is None:
+            t0 = time.monotonic()
+            _modelo = WhisperModel(MODELO, device="cpu", compute_type="int8", cpu_threads=THREADS)
+            print(f"[modelo] {MODELO} carregado em {time.monotonic() - t0:.1f}s", flush=True)
+        return _modelo
+
+
+def _descarregar_ocioso():
+    """Solta o modelo depois de OCIOSO_S sem transcrever. Pega o mesmo lock das
+    transcricoes, entao nunca descarrega no meio de uma; se chegar audio nesse
+    instante, o /transcrever leva 503 e o gravador tenta de novo."""
+    global _modelo
+    while True:
+        time.sleep(30)
+        if not OCIOSO_S or _modelo is None or not _fila.empty():
+            continue
+        if time.monotonic() - _ultimo_uso < OCIOSO_S:
+            continue
+        if not _ocupado.acquire(blocking=False):
+            continue
+        try:
+            with _modelo_lock:
+                _modelo = None
+            _devolver_memoria()
+            print(f"[modelo] descarregado depois de {OCIOSO_S}s sem uso", flush=True)
+        finally:
+            _ocupado.release()
+
+
+threading.Thread(target=_descarregar_ocioso, daemon=True).start()
 
 
 def _run(cmd, timeout_s):
@@ -204,7 +276,7 @@ def _transcrever_fonte(rotulo: str, wav: str):
         bloco = f"{wav}.b{int(offset)}.wav"
         _corta_bloco(wav, offset, bloco_dur, bloco)
         try:
-            segs, info = model.transcribe(bloco, language=IDIOMA, vad_filter=True)
+            segs, info = _modelo_whisper().transcribe(bloco, language=IDIOMA, vad_filter=True)
             idioma = info.language
             for s in segs:
                 txt = s.text.strip()
@@ -230,17 +302,22 @@ def _transcrever_arquivo(src: str):
     """Nucleo compartilhado pelos dois modos: separa os canais (ou faz downmix
     quando e mono, caso do gravador do celular), transcreve e devolve
     (idioma, segmentos ordenados no tempo)."""
+    global _ultimo_uso
     segmentos = []
     idioma_detectado = None
-    for rotulo, wav in _fontes(src):
-        idioma, segs = _transcrever_fonte(rotulo, wav)
-        if idioma:
-            idioma_detectado = idioma
-        segmentos.extend(segs)
-        try:
-            os.remove(wav)
-        except OSError:
-            pass
+    try:
+        for rotulo, wav in _fontes(src):
+            idioma, segs = _transcrever_fonte(rotulo, wav)
+            if idioma:
+                idioma_detectado = idioma
+            segmentos.extend(segs)
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
+    finally:
+        _ultimo_uso = time.monotonic()
+        _devolver_memoria()
     segmentos.sort(key=lambda x: x["inicio"])
     return idioma_detectado, segmentos
 
@@ -407,6 +484,7 @@ def health():
     inicio = _ocupado_desde
     ocupado_s = round(time.monotonic() - inicio, 1) if inicio is not None else 0
     return {"ok": True, "modelo": MODELO, "idioma": IDIOMA,
+            "modelo_carregado": _modelo is not None,
             "ocupado": _ocupado.locked(), "ocupado_s": ocupado_s,
             "teto_s": _teto_atual, "fila": _fila.qsize()}
 
