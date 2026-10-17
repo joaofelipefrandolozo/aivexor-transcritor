@@ -50,6 +50,10 @@ falha duas vezes (`MAX_TENTATIVAS`) vira `error` em vez de virar loop de restart
   (protege a memória da VPS). Quem chama deve tentar de novo depois.
 - **Transcrição em blocos** (`WHISPER_BLOCO_S`, default 600s): memória
   constante em qualquer duração de reunião.
+- **Versões fixas** (`requirements.txt` + `constraints.txt`): em 2026-10-16 um
+  Implantar sem pin trouxe `av` 19 e toda transcrição passou a dar 500. Para
+  atualizar dependência, construir a imagem e testar com áudio real antes do
+  Implantar (testar a imagem antiga com o `app.py` novo montado não pega isso).
 - **HEALTHCHECK no Dockerfile**: o Docker/EasyPanel marca o container
   unhealthy quando o HTTP para de responder (visível no painel).
 - Um watchdog no n8n ("AIVEXOR Watchdog Transcritor") vigia o `/health` a
