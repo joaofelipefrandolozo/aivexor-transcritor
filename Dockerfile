@@ -5,8 +5,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt constraints.txt ./
+# constraints.txt trava as dependencias indiretas: sem ele um rebuild pode trazer
+# versao nova incompativel (foi o que quebrou a transcricao em 2026-10-16)
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 COPY app.py .
 
 # modelo: medium (bom pra PT). Troque pra large-v3 pra mais precisao.
